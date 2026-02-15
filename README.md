@@ -130,35 +130,23 @@ All configuration is via environment variables (`.env` file).
 
 ## Running as a Service (Linux)
 
-To keep the bot running after you close the terminal, create a systemd service.
+The included `setup.sh` script handles everything: creating the venv, installing dependencies, writing the systemd unit file, enabling the service on boot, and (re)starting it.
 
-Create `/etc/systemd/system/ecoflowbot.service`:
-
-```ini
-[Unit]
-Description=EcoFlow Discord Bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=your-username
-WorkingDirectory=/path/to/ecoflowbot
-ExecStart=/path/to/ecoflowbot/venv/bin/python bot.py
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then enable and start it:
+**First-time install or update:**
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable ecoflowbot
-sudo systemctl start ecoflowbot
-sudo systemctl status ecoflowbot
+sudo ./setup.sh
+```
+
+Re-run the same command after pulling changes to update dependencies and restart the bot.
+
+**Manual service control:**
+
+```bash
+sudo systemctl status ecoflowbot     # check status
+sudo systemctl restart ecoflowbot    # restart
+sudo systemctl stop ecoflowbot       # stop
+journalctl -u ecoflowbot -f          # follow logs
 ```
 
 ## Project Structure
@@ -170,6 +158,7 @@ ecoflowbot/
 ├── ecoflow/
 │   ├── auth.py         HMAC-SHA256 REST auth → MQTT credential retrieval
 │   └── monitor.py      MQTT client — telemetry cache, state transitions, command publishing
+├── setup.sh            Install / update systemd service (run with sudo)
 ├── .env.example        Configuration template (copy to .env)
 ├── requirements.txt    Python dependencies
 └── LICENSE             MIT
