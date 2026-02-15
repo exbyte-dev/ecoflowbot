@@ -32,7 +32,7 @@ class Config:
     charging_watts_threshold: float
 
     # AC output configuration sent with toggle commands
-    # Nigeria uses 220-240 V / 50 Hz (out_freq 1 = 50 Hz, 2 = 60 Hz)
+    # Most of the world uses 220–240 V / 50 Hz; North America uses 120 V / 60 Hz (out_freq 2)
     ac_out_voltage: int
     ac_out_freq: int    # 1 = 50 Hz, 2 = 60 Hz
     ac_xboost: bool     # X-Boost allows running appliances above rated watts

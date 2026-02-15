@@ -2,7 +2,7 @@
 
 A Discord bot that monitors an EcoFlow power station in real time via the official EcoFlow Open API and notifies you when charging starts or stops — useful anywhere with unreliable grid power.
 
-Built to solve a specific problem: load-shedding and power outages in Nigeria are so frequent that knowing the exact moment NEPA restores power (and starts charging the battery) or cuts out again matters for planning.
+Originally built to deal with frequent load-shedding and grid instability, where knowing the exact moment power is restored (and the battery starts charging) or cut out again matters for planning.
 
 ## Features
 

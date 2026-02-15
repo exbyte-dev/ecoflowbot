@@ -327,7 +327,7 @@ class EcoFlowMonitor:
         Enable or disable AC output.
 
         All four params must be sent together — partial updates are ignored
-        by the firmware. Set freq=1 for 50 Hz (Nigeria/EU), freq=2 for 60 Hz (US).
+        by the firmware. Set freq=1 for 50 Hz (most of the world), freq=2 for 60 Hz (North America).
         """
         return self.publish_command(
             operate_type="acOutCfg",
