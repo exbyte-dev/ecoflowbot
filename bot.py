@@ -11,6 +11,7 @@ Usage:
 
 import asyncio
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -84,7 +85,12 @@ def _chg_state_label(state: int | None) -> str:
 # Status embed builder (shared by /status and notifications)
 # ---------------------------------------------------------------------------
 
-def build_status_embed(state: DeviceState, device_sn: str, title: str = "Status", colour: int = COLOUR_INFO) -> discord.Embed:
+def build_status_embed(
+    state: DeviceState,
+    device_sn: str,
+    title: str = "Status",
+    colour: int = COLOUR_INFO,
+) -> discord.Embed:
     embed = discord.Embed(title=title, colour=colour, timestamp=datetime.now(timezone.utc))
     embed.set_footer(text=f"EcoFlow Monitor • {device_sn}")
 
@@ -102,7 +108,6 @@ def build_status_embed(state: DeviceState, device_sn: str, title: str = "Status"
     embed.add_field(name="🔋 Battery", value="\n".join(batt_lines), inline=True)
 
     # ── Power flow ─────────────────────────────────────────────
-    # Use summed watts when available; fall back to AC-only
     watts_in  = state.watts_in  if state.watts_in  is not None else state.ac_in_watts
     watts_out = state.watts_out if state.watts_out is not None else state.ac_out_watts
     embed.add_field(name="⚡ Input",  value=_fmt_watts(watts_in),  inline=True)
@@ -114,13 +119,17 @@ def build_status_embed(state: DeviceState, device_sn: str, title: str = "Status"
         ac_in_parts.append(_fmt_watts(state.ac_in_watts))
     if state.ac_in_freq is not None:
         ac_in_parts.append(f"{state.ac_in_freq:.0f} Hz")
-    embed.add_field(name="🔌 AC Input", value="  ·  ".join(p for p in ac_in_parts if p != "—") or "—", inline=True)
+    embed.add_field(
+        name="🔌 AC Input",
+        value="  ·  ".join(p for p in ac_in_parts if p != "—") or "—",
+        inline=True,
+    )
 
     # ── Output switches ───────────────────────────────────────
     ac_out_val = _onoff(state.ac_out_enabled)
     if state.ac_out_watts is not None:
         ac_out_val += f"  ·  {_fmt_watts(state.ac_out_watts)}"
-    embed.add_field(name="🔌 AC Output", value=ac_out_val, inline=True)
+    embed.add_field(name="🔌 AC Output", value=ac_out_val,                    inline=True)
     embed.add_field(name="🔌 USB / DC",  value=_onoff(state.usb_out_enabled), inline=True)
 
     # ── Temperature ───────────────────────────────────────────
@@ -128,6 +137,183 @@ def build_status_embed(state: DeviceState, device_sn: str, title: str = "Status"
         embed.add_field(name="🌡 Temp", value=_fmt_temp(state.inv_temp_c), inline=True)
 
     return embed
+
+
+# ---------------------------------------------------------------------------
+# Cog — all slash commands live here so py-cord can properly introspect
+# option metadata from real class methods (not closures).
+# ---------------------------------------------------------------------------
+
+class EcoFlowCog(discord.Cog):
+    def __init__(self, bot: "EcoFlowBot") -> None:
+        self.bot = bot
+
+    # ── /status ────────────────────────────────────────────────────────
+
+    @discord.slash_command(name="status", description="Show current power station status")
+    async def cmd_status(self, ctx: discord.ApplicationContext) -> None:
+        # Acknowledge within the 3-second Discord window first.
+        try:
+            await ctx.defer()
+        except discord.NotFound:
+            # Interaction already expired (error 10062) — nothing we can do.
+            return
+
+        try:
+            monitor = self.bot._monitor
+
+            if monitor is None:
+                await ctx.respond("Monitor is not started yet. Try again in a moment.")
+                return
+
+            monitor_connected = await monitor.is_connected
+            
+            if not monitor_connected:
+                await ctx.respond(embed=discord.Embed(
+                    description="Not connected to EcoFlow — trying to reconnect.",
+                    colour=COLOUR_WARN,
+                ))
+                return
+
+            state   = await monitor.get_state()
+            charging = await monitor.current_charging
+            colour  = COLOUR_CHARGING if charging else (COLOUR_STOPPED if charging is False else COLOUR_WARN)
+            embed   = build_status_embed(state, self.bot.cfg.device_sn, colour=colour)
+            await ctx.respond(embed=embed)
+
+        except Exception:
+            logger.exception("Unhandled error in /status")
+            await ctx.respond(embed=discord.Embed(
+                description="An unexpected error occurred.", colour=0xFF0000,
+            ))
+
+    # ── /ac ────────────────────────────────────────────────────────────
+
+    @discord.slash_command(name="ac", description="Turn AC output on or off")
+    @discord.option("state", description="on or off", choices=["on", "off"])
+    async def cmd_ac(self, ctx: discord.ApplicationContext, state: str) -> None:
+        await ctx.defer()
+
+        try:
+            monitor = await self.bot._monitor_ready()
+
+            if monitor is None:
+                await ctx.respond(embed=discord.Embed(
+                    description="Not connected to EcoFlow. Cannot send command.",
+                    colour=COLOUR_WARN,
+                ))
+                return
+
+            enabled = state == "on"
+            ok = await monitor.set_ac_output(
+                enabled=enabled,
+                voltage=self.bot.cfg.ac_out_voltage,
+                freq=self.bot.cfg.ac_out_freq,
+                xboost=self.bot.cfg.ac_xboost,
+            )
+
+            if ok:
+                label  = "ON" if enabled else "OFF"
+                colour = COLOUR_CHARGING if enabled else COLOUR_STOPPED
+                embed  = discord.Embed(
+                    description=f"AC output command sent — turning **{label}**.",
+                    colour=colour,
+                )
+                embed.set_footer(text=f"Device: {self.bot.cfg.device_sn}")
+            else:
+                embed = discord.Embed(
+                    description="Command failed — MQTT not connected.",
+                    colour=COLOUR_WARN,
+                )
+            await ctx.respond(embed=embed)
+
+        except Exception:
+            logger.exception("Unhandled error in /ac")
+            await ctx.respond(embed=discord.Embed(
+                description="An unexpected error occurred.", colour=0xFF0000,
+            ))
+
+    # ── /usb ───────────────────────────────────────────────────────────
+
+    @discord.slash_command(name="usb", description="Turn USB / DC output on or off")
+    @discord.option("state", description="on or off", choices=["on", "off"])
+    async def cmd_usb(self, ctx: discord.ApplicationContext, state: str) -> None:
+        await ctx.defer()
+
+        try:
+            monitor = await self.bot._monitor_ready()
+
+            if monitor is None:
+                await ctx.respond(embed=discord.Embed(
+                    description="Not connected to EcoFlow. Cannot send command.",
+                    colour=COLOUR_WARN,
+                ))
+                return
+
+            enabled = state == "on"
+            ok = await monitor.set_usb_output(enabled)
+
+            if ok:
+                label  = "ON" if enabled else "OFF"
+                colour = COLOUR_CHARGING if enabled else COLOUR_STOPPED
+                embed  = discord.Embed(
+                    description=f"USB / DC output command sent — turning **{label}**.",
+                    colour=colour,
+                )
+                embed.set_footer(text=f"Device: {self.bot.cfg.device_sn}")
+            else:
+                embed = discord.Embed(
+                    description="Command failed — MQTT not connected.",
+                    colour=COLOUR_WARN,
+                )
+            await ctx.respond(embed=embed)
+
+        except Exception:
+            logger.exception("Unhandled error in /usb")
+            await ctx.respond(embed=discord.Embed(
+                description="An unexpected error occurred.", colour=0xFF0000,
+            ))
+
+    # ── /dc ────────────────────────────────────────────────────────────
+
+    @discord.slash_command(name="dc", description="Turn 12 V car / cigarette-lighter port on or off")
+    @discord.option("state", description="on or off", choices=["on", "off"])
+    async def cmd_dc(self, ctx: discord.ApplicationContext, state: str) -> None:
+        await ctx.defer()
+
+        try:
+            monitor = await self.bot._monitor_ready()
+
+            if monitor is None:
+                await ctx.respond(embed=discord.Embed(
+                    description="Not connected to EcoFlow. Cannot send command.",
+                    colour=COLOUR_WARN,
+                ))
+                return
+
+            enabled = state == "on"
+            ok = await monitor.set_dc_car_output(enabled)
+
+            if ok:
+                label  = "ON" if enabled else "OFF"
+                colour = COLOUR_CHARGING if enabled else COLOUR_STOPPED
+                embed  = discord.Embed(
+                    description=f"12 V car port command sent — turning **{label}**.",
+                    colour=colour,
+                )
+                embed.set_footer(text=f"Device: {self.bot.cfg.device_sn}")
+            else:
+                embed = discord.Embed(
+                    description="Command failed — MQTT not connected.",
+                    colour=COLOUR_WARN,
+                )
+            await ctx.respond(embed=embed)
+
+        except Exception:
+            logger.exception("Unhandled error in /dc")
+            await ctx.respond(embed=discord.Embed(
+                description="An unexpected error occurred.", colour=0xFF0000,
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -140,15 +326,13 @@ class EcoFlowBot(discord.Bot):
         super().__init__(intents=intents)
         self.cfg = config
         self._monitor: EcoFlowMonitor | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._register_commands()
+        self.add_cog(EcoFlowCog(self))
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def on_ready(self) -> None:
-        self._loop = asyncio.get_running_loop()
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         await self._start_monitor()
 
@@ -165,7 +349,7 @@ class EcoFlowBot(discord.Bot):
     async def _start_monitor(self) -> None:
         try:
             logger.info("Fetching EcoFlow MQTT credentials…")
-            creds = await asyncio.get_running_loop().run_in_executor(
+            creds = await self.loop.run_in_executor(
                 None,
                 get_mqtt_credentials,
                 self.cfg.api_host,
@@ -204,7 +388,7 @@ class EcoFlowBot(discord.Bot):
                 description=f"Connected to EcoFlow data stream. Monitoring `{self.cfg.device_sn}`.",
                 colour=COLOUR_INFO,
             )),
-            self._loop,
+            self.loop,
         )
 
     def _on_mqtt_disconnect(self) -> None:
@@ -212,12 +396,12 @@ class EcoFlowBot(discord.Bot):
 
     def _on_charging_start(self, state: DeviceState) -> None:
         asyncio.run_coroutine_threadsafe(
-            self._notify_charging_start(state), self._loop
+            self._notify_charging_start(state), self.loop
         )
 
     def _on_charging_stop(self, state: DeviceState) -> None:
         asyncio.run_coroutine_threadsafe(
-            self._notify_charging_stop(state), self._loop
+            self._notify_charging_stop(state), self.loop
         )
 
     # ------------------------------------------------------------------
@@ -267,145 +451,13 @@ class EcoFlowBot(discord.Bot):
     # Guard helpers used by slash commands
     # ------------------------------------------------------------------
 
-    def _monitor_ready(self) -> EcoFlowMonitor | None:
+    async def _monitor_ready(self) -> EcoFlowMonitor | None:
         """Return the monitor if ready, or None."""
-        return self._monitor if self._monitor and self._monitor.is_connected else None
-
-    # ------------------------------------------------------------------
-    # Slash commands
-    # ------------------------------------------------------------------
-
-    def _register_commands(self) -> None:
-
-        # ── /status ────────────────────────────────────────────────────
-        @self.slash_command(name="status", description="Show current power station status")
-        async def cmd_status(ctx: discord.ApplicationContext) -> None:
-            await ctx.defer()
-            monitor = self._monitor
-
-            if monitor is None:
-                await ctx.respond("Monitor is not started yet. Try again in a moment.")
-                return
-
-            if not monitor.is_connected:
-                await ctx.respond(embed=discord.Embed(
-                    description="Not connected to EcoFlow — trying to reconnect.",
-                    colour=COLOUR_WARN,
-                ))
-                return
-
-            state = monitor.get_state()
-            charging = monitor.current_charging
-            colour = COLOUR_CHARGING if charging else (COLOUR_STOPPED if charging is False else COLOUR_WARN)
-            embed = build_status_embed(state, self.cfg.device_sn, colour=colour)
-            await ctx.respond(embed=embed)
-
-        # ── /ac ────────────────────────────────────────────────────────
-        @self.slash_command(name="ac", description="Turn AC output on or off")
-        async def cmd_ac(
-            ctx: discord.ApplicationContext,
-            state: discord.Option(str, "on or off", choices=["on", "off"]),
-        ) -> None:
-            await ctx.defer()
-            monitor = self._monitor_ready()
-
-            if monitor is None:
-                await ctx.respond(embed=discord.Embed(
-                    description="Not connected to EcoFlow. Cannot send command.",
-                    colour=COLOUR_WARN,
-                ))
-                return
-
-            enabled = state == "on"
-            ok = monitor.set_ac_output(
-                enabled=enabled,
-                voltage=self.cfg.ac_out_voltage,
-                freq=self.cfg.ac_out_freq,
-                xboost=self.cfg.ac_xboost,
-            )
-
-            if ok:
-                label = "ON" if enabled else "OFF"
-                colour = COLOUR_CHARGING if enabled else COLOUR_STOPPED
-                embed = discord.Embed(
-                    description=f"AC output command sent — turning **{label}**.",
-                    colour=colour,
-                )
-                embed.set_footer(text=f"Device: {self.cfg.device_sn}")
-            else:
-                embed = discord.Embed(
-                    description="Command failed — MQTT not connected.",
-                    colour=COLOUR_WARN,
-                )
-            await ctx.respond(embed=embed)
-
-        # ── /usb ───────────────────────────────────────────────────────
-        @self.slash_command(name="usb", description="Turn USB / DC output on or off")
-        async def cmd_usb(
-            ctx: discord.ApplicationContext,
-            state: discord.Option(str, "on or off", choices=["on", "off"]),
-        ) -> None:
-            await ctx.defer()
-            monitor = self._monitor_ready()
-
-            if monitor is None:
-                await ctx.respond(embed=discord.Embed(
-                    description="Not connected to EcoFlow. Cannot send command.",
-                    colour=COLOUR_WARN,
-                ))
-                return
-
-            enabled = state == "on"
-            ok = monitor.set_usb_output(enabled)
-
-            if ok:
-                label = "ON" if enabled else "OFF"
-                colour = COLOUR_CHARGING if enabled else COLOUR_STOPPED
-                embed = discord.Embed(
-                    description=f"USB / DC output command sent — turning **{label}**.",
-                    colour=colour,
-                )
-                embed.set_footer(text=f"Device: {self.cfg.device_sn}")
-            else:
-                embed = discord.Embed(
-                    description="Command failed — MQTT not connected.",
-                    colour=COLOUR_WARN,
-                )
-            await ctx.respond(embed=embed)
-
-        # ── /dc ────────────────────────────────────────────────────────
-        @self.slash_command(name="dc", description="Turn 12 V car / cigarette-lighter port on or off")
-        async def cmd_dc(
-            ctx: discord.ApplicationContext,
-            state: discord.Option(str, "on or off", choices=["on", "off"]),
-        ) -> None:
-            await ctx.defer()
-            monitor = self._monitor_ready()
-
-            if monitor is None:
-                await ctx.respond(embed=discord.Embed(
-                    description="Not connected to EcoFlow. Cannot send command.",
-                    colour=COLOUR_WARN,
-                ))
-                return
-
-            enabled = state == "on"
-            ok = monitor.set_dc_car_output(enabled)
-
-            if ok:
-                label = "ON" if enabled else "OFF"
-                colour = COLOUR_CHARGING if enabled else COLOUR_STOPPED
-                embed = discord.Embed(
-                    description=f"12 V car port command sent — turning **{label}**.",
-                    colour=colour,
-                )
-                embed.set_footer(text=f"Device: {self.cfg.device_sn}")
-            else:
-                embed = discord.Embed(
-                    description="Command failed — MQTT not connected.",
-                    colour=COLOUR_WARN,
-                )
-            await ctx.respond(embed=embed)
+        monitor = self._monitor
+        if monitor is None:
+            return None
+        monitor_connected = await monitor.is_connected
+        return monitor if monitor_connected else None
 
 
 # ---------------------------------------------------------------------------
@@ -419,9 +471,9 @@ def main() -> None:
         logger.error("Configuration error: %s", exc)
         sys.exit(1)
 
-    # Python 3.12+ no longer auto-creates an event loop; py-cord's __init__
-    # calls asyncio.get_event_loop() before bot.run() sets one up, so we
-    # create and register the loop explicitly.
+    # Python 3.12+ no longer implicitly creates an event loop on the main
+    # thread.  discord.Bot.__init__ needs one before bot.run() sets things up,
+    # so we create and register it explicitly.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 

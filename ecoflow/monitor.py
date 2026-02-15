@@ -316,7 +316,7 @@ class EcoFlowMonitor:
         )
         return result.rc == mqtt.MQTT_ERR_SUCCESS
 
-    def set_ac_output(
+    async def set_ac_output(
         self,
         enabled: bool,
         voltage: int = 230,
@@ -340,7 +340,7 @@ class EcoFlowMonitor:
             },
         )
 
-    def set_usb_output(self, enabled: bool) -> bool:
+    async def set_usb_output(self, enabled: bool) -> bool:
         """Enable or disable USB / DC 5 V–12 V output ports."""
         return self.publish_command(
             operate_type="dcOutCfg",
@@ -348,7 +348,7 @@ class EcoFlowMonitor:
             params={"enabled": int(enabled)},
         )
 
-    def set_dc_car_output(self, enabled: bool) -> bool:
+    async def set_dc_car_output(self, enabled: bool) -> bool:
         """Enable or disable the 12 V car / cigarette-lighter port."""
         return self.publish_command(
             operate_type="mpptCar",
@@ -360,19 +360,19 @@ class EcoFlowMonitor:
     # Public accessors
     # ------------------------------------------------------------------
 
-    def get_state(self) -> DeviceState:
+    async def get_state(self) -> DeviceState:
         """Return a snapshot of the latest cached device state."""
         with self._lock:
             flat_snapshot = dict(self._flat)
         return DeviceState(flat_snapshot, self._watts_threshold)
 
     @property
-    def is_connected(self) -> bool:
+    async def is_connected(self) -> bool:
         with self._lock:
             return self._connected
 
     @property
-    def current_charging(self) -> bool | None:
+    async def current_charging(self) -> bool | None:
         """Current charging state (None if not yet determined)."""
         with self._lock:
             return self._charging
