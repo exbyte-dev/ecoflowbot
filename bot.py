@@ -331,29 +331,6 @@ class EcoFlowCog(discord.Cog):
                     name=f"{icon} {state.soc:.0f}% | {label}",
                 )
                 await self.bot.change_presence(activity=activity)
-
-                print(f"\nPresence updated:\n{icon} {state.soc:.0f}% | {label}")
-            
-            else:
-                # get data from rest api
-                flat = await self.bot.loop.run_in_executor(
-                    None,
-                    get_device_quota,
-                    self.bot.cfg.api_host,
-                    self.bot.cfg.ecoflow_access_key,
-                    self.bot.cfg.ecoflow_secret_key,
-                    self.bot.cfg.device_sn,
-                )
-                state = DeviceState(flat, self.bot.cfg.charging_watts_threshold)
-                icon = "⚡" if state.is_charging else "🔋"
-                label = "Charging" if state.is_charging else "Idle"
-                activity = discord.Activity(
-                    type=discord.ActivityType.watching,
-                    name=f"{icon} {state.soc:.0f}% | {label}",
-                )
-                await self.bot.change_presence(activity=activity)
-
-                print(f"\nPresence updated:\n{icon} {state.soc:.0f}% | {label}")
         except Exception:
             logger.debug("Failed to update presence", exc_info=True)
     

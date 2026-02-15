@@ -297,6 +297,21 @@ class EcoFlowMonitor:
         if self._on_disconnect_cb:
             self._on_disconnect_cb()
 
+    # Module-type → key-prefix mapping.
+    # The REST API returns keys like "pd.soc", "inv.inputWatts", etc.,
+    # but MQTT sends them without the prefix under a `moduleType` field.
+    _MODULE_PREFIX: dict[int, str] = {
+        1: "pd",
+        2: "bms_emsStatus",
+        3: "inv",
+        5: "mppt",
+    }
+
+    # Keys that identify bms_bmsStatus vs bms_emsStatus when moduleType == 2
+    _BMS_STATUS_KEYS = {"soc", "vol", "amp", "cycles", "soh", "temp",
+                        "maxCellVol", "minCellVol", "maxCellTemp", "minCellTemp",
+                        "f32ShowSoc", "remainCap", "fullCap", "designCap"}
+
     def _on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
@@ -304,18 +319,25 @@ class EcoFlowMonitor:
             logger.debug("Bad MQTT payload: %s", exc)
             return
 
-        logger.info(
-            "MQTT msg on %s — top-level keys: %s",
-            msg.topic, list(payload.keys()),
-        )
-
         params = payload.get("params", payload)
         incoming = _flatten(params)
 
-        logger.info(
-            "Flattened %d keys; sample: %s",
-            len(incoming),
-            list(incoming.keys())[:8],
+        # ── Determine the correct key prefix from moduleType ──────────
+        module_type = payload.get("moduleType")
+        prefix = self._MODULE_PREFIX.get(module_type, "") if module_type is not None else ""
+
+        # moduleType 2 is ambiguous: could be bms_emsStatus OR bms_bmsStatus.
+        # Disambiguate by checking whether the keys look like cell-level data.
+        if module_type == 2 and incoming.keys() & self._BMS_STATUS_KEYS:
+            prefix = "bms_bmsStatus"
+
+        # Prepend prefix to every key so the cache matches the REST format.
+        if prefix:
+            incoming = {f"{prefix}.{k}": v for k, v in incoming.items()}
+
+        logger.debug(
+            "MQTT moduleType=%s → prefix=%s, %d keys",
+            module_type, prefix or "(none)", len(incoming),
         )
 
         with self._lock:
