@@ -16,6 +16,7 @@ import sys
 from datetime import datetime, timezone
 
 import discord
+from discord.ext import tasks
 
 from config import Config
 from ecoflow.auth import get_device_quota, get_mqtt_credentials
@@ -90,109 +91,211 @@ def _chg_state_label(state: int | None) -> str:
 # Status embed builder (shared by /status and notifications)
 # ---------------------------------------------------------------------------
 
+def _battery_bar(pct: float | None, length: int = 10) -> str:
+    """Build a visual progress bar for battery level."""
+    if pct is None:
+        return "`" + "░" * length + "`  —"
+    filled = round(pct / 100 * length)
+    bar = "█" * filled + "░" * (length - filled)
+    return f"`{bar}`  **{pct:.0f}%**"
+
+
+def _status_icon(is_charging: bool | None) -> str:
+    if is_charging is True:
+        return "⚡"
+    if is_charging is False:
+        return "💤"
+    return "❓"
+
+
 def build_status_embed(
     state: DeviceState,
     device_sn: str,
     title: str = "Status",
     colour: int = COLOUR_INFO,
 ) -> discord.Embed:
-    embed = discord.Embed(title=title, colour=colour, timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"EcoFlow Monitor • {device_sn}")
+    embed = discord.Embed(colour=colour, timestamp=datetime.now(timezone.utc))
+    embed.set_footer(text=f"EcoFlow • {device_sn}")
 
     if not state.has_data:
-        embed.description = "No data received yet — waiting for device telemetry."
+        embed.title = title
+        embed.description = "⏳ No data received yet — waiting for device telemetry."
         return embed
 
-    # ── Battery ────────────────────────────────────────────────
-    batt_lines = [f"**{_fmt_pct(state.soc)}**"]
+    # ── Title with status icon ────────────────────────────────
+    icon = _status_icon(state.is_charging)
+    status_label = "Charging" if state.is_charging else ("Idle" if state.is_charging is False else "Unknown")
+    embed.title = f"{icon}  {title} — {status_label}"
+
+    # ── Battery hero section (description) ────────────────────
+    desc_lines = [_battery_bar(state.soc)]
     if state.is_charging and state.chg_remain_min:
-        batt_lines.append(f"Full in ~{_fmt_remain(state.chg_remain_min)}")
+        desc_lines.append(f"🕐 Full in **~{_fmt_remain(state.chg_remain_min)}**")
     elif not state.is_charging and state.dsg_remain_min:
-        batt_lines.append(f"~{_fmt_remain(state.dsg_remain_min)} remaining")
-    batt_lines.append(_chg_state_label(state.chg_state))
+        desc_lines.append(f"🕐 **~{_fmt_remain(state.dsg_remain_min)}** remaining")
     if state.batt_remain_cap is not None and state.batt_full_cap is not None:
-        batt_lines.append(f"{state.batt_remain_cap:.0f} / {state.batt_full_cap:.0f} mAh")
-    embed.add_field(name="🔋 Battery", value="\n".join(batt_lines), inline=True)
+        desc_lines.append(f"📦 {state.batt_remain_cap:.0f} / {state.batt_full_cap:.0f} mAh")
+    desc_lines.append(f"🔄 {_chg_state_label(state.chg_state)}")
+    embed.description = "\n".join(desc_lines)
 
     # ── Power flow ─────────────────────────────────────────────
     watts_in  = state.watts_in  if state.watts_in  is not None else state.ac_in_watts
     watts_out = state.watts_out if state.watts_out is not None else state.ac_out_watts
-    embed.add_field(name="⚡ Input",  value=_fmt_watts(watts_in),  inline=True)
-    embed.add_field(name="💡 Output", value=_fmt_watts(watts_out), inline=True)
+    power_lines = [
+        f"⬇️ In: **{_fmt_watts(watts_in)}**",
+        f"⬆️ Out: **{_fmt_watts(watts_out)}**",
+        f"☀️ Solar: **{_fmt_watts(state.solar_watts)}**",
+    ]
+    embed.add_field(name="⚡ Power Flow", value="\n".join(power_lines), inline=True)
 
-    # ── Solar / MPPT ───────────────────────────────────────────
-    embed.add_field(name="☀️ Solar", value=_fmt_watts(state.solar_watts), inline=True)
-
-    # ── AC input ───────────────────────────────────────────────
-    ac_in_parts = [_fmt_volts(state.ac_in_voltage)]
+    # ── AC ────────────────────────────────────────────────────
+    ac_lines = []
+    # Input
+    ac_in_parts = []
+    if state.ac_in_voltage is not None:
+        ac_in_parts.append(_fmt_volts(state.ac_in_voltage))
     if state.ac_in_watts is not None:
         ac_in_parts.append(_fmt_watts(state.ac_in_watts))
     if state.ac_in_freq is not None:
         ac_in_parts.append(f"{state.ac_in_freq:.0f} Hz")
-    embed.add_field(
-        name="🔌 AC In",
-        value="  ·  ".join(p for p in ac_in_parts if p != "—") or "—",
-        inline=True,
-    )
-
-    # ── AC output ─────────────────────────────────────────────
-    ac_out_parts = [_onoff(state.ac_out_enabled)]
+    ac_lines.append(f"**In:** {' · '.join(ac_in_parts) if ac_in_parts else '—'}")
+    # Output
+    ac_out_status = "🟢" if state.ac_out_enabled else "🔴" if state.ac_out_enabled is not None else "⚪"
+    ac_out_parts = []
     if state.ac_out_voltage is not None:
         ac_out_parts.append(_fmt_volts(state.ac_out_voltage))
-    if state.ac_out_freq is not None:
-        ac_out_parts.append(f"{state.ac_out_freq:.0f} Hz")
     if state.ac_out_watts is not None:
         ac_out_parts.append(_fmt_watts(state.ac_out_watts))
-    embed.add_field(name="🔌 AC Out", value="  ·  ".join(ac_out_parts), inline=True)
+    if state.ac_out_freq is not None:
+        ac_out_parts.append(f"{state.ac_out_freq:.0f} Hz")
+    ac_lines.append(f"**Out:** {ac_out_status} {' · '.join(ac_out_parts) if ac_out_parts else _onoff(state.ac_out_enabled)}")
+    embed.add_field(name="🔌 AC", value="\n".join(ac_lines), inline=True)
 
-    # ── DC ports ──────────────────────────────────────────────
+    # ── DC / USB ports ────────────────────────────────────────
     port_lines = []
-    # USB-A
+    usb_status = "🟢" if state.usb_out_enabled else "🔴" if state.usb_out_enabled is not None else "⚪"
     usb_a = (state.usb1_watts or 0) + (state.usb2_watts or 0) + \
             (state.qc_usb1_watts or 0) + (state.qc_usb2_watts or 0)
-    usb_a_state = _onoff(state.usb_out_enabled)
-    port_lines.append(f"USB-A: {usb_a_state}  ({usb_a:.0f} W)" if usb_a else f"USB-A: {usb_a_state}")
-    # USB-C
+    port_lines.append(f"**USB-A:** {usb_status} {f'{usb_a:.0f} W' if usb_a else ''}")
     usb_c = (state.typec1_watts or 0) + (state.typec2_watts or 0)
     if usb_c:
-        port_lines.append(f"USB-C: {usb_c:.0f} W")
+        port_lines.append(f"**USB-C:** {usb_c:.0f} W")
         if state.typec1_watts:
-            port_lines.append(f"  C1: {state.typec1_watts:.0f} W")
+            port_lines.append(f"  └ C1: {state.typec1_watts:.0f} W")
         if state.typec2_watts:
-            port_lines.append(f"  C2: {state.typec2_watts:.0f} W")
+            port_lines.append(f"  └ C2: {state.typec2_watts:.0f} W")
     else:
-        port_lines.append("USB-C: —")
-    # 12 V car
-    car_state = _onoff(state.dc_out_enabled)
+        port_lines.append("**USB-C:** —")
+    car_status = "🟢" if state.dc_out_enabled else "🔴" if state.dc_out_enabled is not None else "⚪"
     car_w = state.car_watts
-    port_lines.append(f"Car 12V: {car_state}  ({car_w:.0f} W)" if car_w else f"Car 12V: {car_state}")
-    embed.add_field(name="🔌 DC Ports", value="\n".join(port_lines), inline=True)
+    port_lines.append(f"**12V Car:** {car_status} {f'{car_w:.0f} W' if car_w else ''}")
+    embed.add_field(name="� DC Ports", value="\n".join(port_lines), inline=False)
 
-    # ── Battery health ────────────────────────────────────────
-    health_parts = []
+    # ── Health & temps (combined row) ─────────────────────────
+    info_lines = []
     if state.batt_soh is not None:
-        health_parts.append(f"SOH {state.batt_soh}%")
+        info_lines.append(f"🏥 SOH: **{state.batt_soh}%**")
     if state.batt_cycles is not None:
-        health_parts.append(f"{state.batt_cycles} cycles")
-    if health_parts:
-        embed.add_field(name="🏥 Health", value="\n".join(health_parts), inline=True)
-
-    # ── Temperatures ──────────────────────────────────────────
-    temp_parts = []
+        info_lines.append(f"🔁 **{state.batt_cycles}** cycles")
     if state.batt_temp_c is not None:
-        temp_parts.append(f"Battery: {_fmt_temp(state.batt_temp_c)}")
+        info_lines.append(f"🌡 Batt: **{_fmt_temp(state.batt_temp_c)}**")
     if state.inv_temp_c is not None:
-        temp_parts.append(f"Inverter: {_fmt_temp(state.inv_temp_c)}")
-    if temp_parts:
-        embed.add_field(name="🌡 Temps", value="\n".join(temp_parts), inline=True)
+        info_lines.append(f"🌡 Inv: **{_fmt_temp(state.inv_temp_c)}**")
+    if info_lines:
+        embed.add_field(name="📊 Health & Temps", value="  ·  ".join(info_lines), inline=False)
 
-    # ── Charge limits (only show if non-default) ──────────────
+    # ── Charge limits ─────────────────────────────────────────
     if state.max_charge_soc is not None or state.min_dsg_soc is not None:
-        max_s = f"Max {state.max_charge_soc}%" if state.max_charge_soc is not None else "Max —"
-        min_s = f"Min {state.min_dsg_soc}%" if state.min_dsg_soc is not None else "Min —"
-        embed.add_field(name="⚙️ Limits", value=f"{max_s}\n{min_s}", inline=True)
+        max_s = f"⬆️ Max {state.max_charge_soc}%" if state.max_charge_soc is not None else ""
+        min_s = f"⬇️ Min {state.min_dsg_soc}%" if state.min_dsg_soc is not None else ""
+        embed.add_field(name="⚙️ Charge Limits", value=f"{max_s}  {min_s}".strip(), inline=False)
 
     return embed
+
+
+# ---------------------------------------------------------------------------
+# Interactive status view (buttons)
+# ---------------------------------------------------------------------------
+
+class StatusView(discord.ui.View):
+    """Persistent buttons attached to the /status embed."""
+
+    def __init__(self, bot: "EcoFlowBot") -> None:
+        super().__init__(timeout=120)  # buttons work for 2 minutes
+        self.bot = bot
+
+    async def _refresh_embed(self, interaction: discord.Interaction) -> None:
+        """Fetch fresh data and update the embed in-place."""
+        cfg = self.bot.cfg
+        loop = asyncio.get_event_loop()
+        flat = await loop.run_in_executor(
+            None, get_device_quota,
+            cfg.api_host, cfg.ecoflow_access_key,
+            cfg.ecoflow_secret_key, cfg.device_sn,
+        )
+        state  = DeviceState(flat, cfg.charging_watts_threshold)
+        colour = COLOUR_CHARGING if state.is_charging else (COLOUR_STOPPED if state.is_charging is False else COLOUR_WARN)
+        embed  = build_status_embed(state, cfg.device_sn, colour=colour)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary)
+    async def btn_refresh(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        try:
+            await self._refresh_embed(interaction)
+        except Exception:
+            logger.exception("Error refreshing status")
+            await interaction.response.send_message(
+                "❌ Failed to refresh.", ephemeral=True,
+            )
+
+    @discord.ui.button(label="AC Toggle", emoji="⚡", style=discord.ButtonStyle.primary)
+    async def btn_ac_toggle(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        try:
+            monitor = await self.bot._monitor_ready()
+            if monitor is None:
+                await interaction.response.send_message(
+                    "❌ Not connected to EcoFlow.", ephemeral=True,
+                )
+                return
+            state = await monitor.get_state()
+            new_state = not state.ac_out_enabled if state.ac_out_enabled is not None else True
+            await monitor.set_ac_output(
+                enabled=new_state,
+                voltage=self.bot.cfg.ac_out_voltage,
+                freq=self.bot.cfg.ac_out_freq,
+                xboost=self.bot.cfg.ac_xboost,
+            )
+            label = "ON" if new_state else "OFF"
+            await interaction.response.send_message(
+                f"⚡ AC → **{label}**", ephemeral=True,
+            )
+        except Exception:
+            logger.exception("Error toggling AC via button")
+            await interaction.response.send_message(
+                "❌ Failed to toggle AC.", ephemeral=True,
+            )
+
+    @discord.ui.button(label="USB Toggle", emoji="🔌", style=discord.ButtonStyle.primary)
+    async def btn_usb_toggle(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        try:
+            monitor = await self.bot._monitor_ready()
+            if monitor is None:
+                await interaction.response.send_message(
+                    "❌ Not connected to EcoFlow.", ephemeral=True,
+                )
+                return
+            state = await monitor.get_state()
+            new_state = not state.usb_out_enabled if state.usb_out_enabled is not None else True
+            await monitor.set_usb_output(new_state)
+            label = "ON" if new_state else "OFF"
+            await interaction.response.send_message(
+                f"🔌 USB → **{label}**", ephemeral=True,
+            )
+        except Exception:
+            logger.exception("Error toggling USB via button")
+            await interaction.response.send_message(
+                "❌ Failed to toggle USB.", ephemeral=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +313,7 @@ class EcoFlowCog(discord.Cog):
     async def cmd_status(self, ctx: discord.ApplicationContext) -> None:
         # Acknowledge within the 3-second Discord window first.
         try:
-            await ctx.defer()
+            await ctx.defer(ephemeral=True)
         except discord.NotFound:
             # Interaction already expired (error 10062) — nothing we can do.
             return
@@ -232,13 +335,14 @@ class EcoFlowCog(discord.Cog):
             state  = DeviceState(flat, cfg.charging_watts_threshold)
             colour = COLOUR_CHARGING if state.is_charging else (COLOUR_STOPPED if state.is_charging is False else COLOUR_WARN)
             embed  = build_status_embed(state, cfg.device_sn, colour=colour)
-            await ctx.respond(embed=embed)
+            view   = StatusView(self.bot)
+            await ctx.respond(embed=embed, view=view, ephemeral=True)
 
         except Exception:
             logger.exception("Unhandled error in /status")
             await ctx.respond(embed=discord.Embed(
                 description="An unexpected error occurred.", colour=0xFF0000,
-            ))
+            ), ephemeral=True)
 
     # ── /ac ────────────────────────────────────────────────────────────
 
@@ -251,7 +355,7 @@ class EcoFlowCog(discord.Cog):
                         choices=["on", "off"]
                     )
                     ) -> None:
-        await ctx.defer()
+        await ctx.defer(ephemeral=True)
 
         try:
             monitor = await self.bot._monitor_ready()
@@ -260,7 +364,7 @@ class EcoFlowCog(discord.Cog):
                 await ctx.respond(embed=discord.Embed(
                     description="Not connected to EcoFlow. Cannot send command.",
                     colour=COLOUR_WARN,
-                ))
+                ), ephemeral=True)
                 return
 
             enabled = state == "on"
@@ -284,13 +388,13 @@ class EcoFlowCog(discord.Cog):
                     description="Command failed — MQTT not connected.",
                     colour=COLOUR_WARN,
                 )
-            await ctx.respond(embed=embed)
+            await ctx.respond(embed=embed, ephemeral=True)
 
         except Exception:
             logger.exception("Unhandled error in /ac")
             await ctx.respond(embed=discord.Embed(
                 description="An unexpected error occurred.", colour=0xFF0000,
-            ))
+            ), ephemeral=True)
 
     # ── /usb ───────────────────────────────────────────────────────────
 
@@ -303,7 +407,7 @@ class EcoFlowCog(discord.Cog):
                         choices=["on", "off"]
                     )
                     ) -> None:
-        await ctx.defer()
+        await ctx.defer(ephemeral=True)
 
         try:
             monitor = await self.bot._monitor_ready()
@@ -312,7 +416,7 @@ class EcoFlowCog(discord.Cog):
                 await ctx.respond(embed=discord.Embed(
                     description="Not connected to EcoFlow. Cannot send command.",
                     colour=COLOUR_WARN,
-                ))
+                ), ephemeral=True)
                 return
 
             enabled = state == "on"
@@ -331,13 +435,13 @@ class EcoFlowCog(discord.Cog):
                     description="Command failed — MQTT not connected.",
                     colour=COLOUR_WARN,
                 )
-            await ctx.respond(embed=embed)
+            await ctx.respond(embed=embed, ephemeral=True)
 
         except Exception:
             logger.exception("Unhandled error in /usb")
             await ctx.respond(embed=discord.Embed(
                 description="An unexpected error occurred.", colour=0xFF0000,
-            ))
+            ), ephemeral=True)
 
     # ── /dc ────────────────────────────────────────────────────────────
 
@@ -350,7 +454,7 @@ class EcoFlowCog(discord.Cog):
                         choices=["on", "off"]
                     )
                     ) -> None:
-        await ctx.defer()
+        await ctx.defer(ephemeral=True)
 
         try:
             monitor = await self.bot._monitor_ready()
@@ -359,7 +463,7 @@ class EcoFlowCog(discord.Cog):
                 await ctx.respond(embed=discord.Embed(
                     description="Not connected to EcoFlow. Cannot send command.",
                     colour=COLOUR_WARN,
-                ))
+                ), ephemeral=True)
                 return
 
             enabled = state == "on"
@@ -378,13 +482,13 @@ class EcoFlowCog(discord.Cog):
                     description="Command failed — MQTT not connected.",
                     colour=COLOUR_WARN,
                 )
-            await ctx.respond(embed=embed)
+            await ctx.respond(embed=embed, ephemeral=True)
 
         except Exception:
             logger.exception("Unhandled error in /dc")
             await ctx.respond(embed=discord.Embed(
                 description="An unexpected error occurred.", colour=0xFF0000,
-            ))
+            ), ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -406,12 +510,39 @@ class EcoFlowBot(discord.Bot):
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         await self._start_monitor()
+        if not self._update_presence.is_running():
+            self._update_presence.start()
 
     async def close(self) -> None:
+        if self._update_presence.is_running():
+            self._update_presence.cancel()
         if self._monitor:
             logger.info("Stopping MQTT monitor…")
             self._monitor.stop()
         await super().close()
+
+    # ------------------------------------------------------------------
+    # Presence update loop  (py-cord tasks extension)
+    # ------------------------------------------------------------------
+
+    @tasks.loop(seconds=60)
+    async def _update_presence(self) -> None:
+        """Update bot status to show battery percentage."""
+        try:
+            if self._monitor is None:
+                return
+            state = await self._monitor.get_state()
+            if state.soc is not None:
+                icon = "⚡" if state.is_charging else "🔋"
+                label = "Charging" if state.is_charging else "Idle"
+                activity = discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=f"{icon} {state.soc:.0f}% | {label}",
+                )
+                await self.change_presence(activity=activity)
+                print(f"\nPresence updated:\n{icon} {state.soc:.0f}% | {label}")
+        except Exception:
+            logger.debug("Failed to update presence", exc_info=True)
 
     # ------------------------------------------------------------------
     # Monitor startup

@@ -96,8 +96,6 @@ def get_device_quota(api_host: str, access_key: str, secret_key: str, device_sn:
             f"EcoFlow API error (code={code}): {body.get('message', 'Unknown error')}"
         )
 
-    print(body)
-    print(f"\n\n\n\n{body['data']}\n\n\n\n")
     return body["data"]
 
 
