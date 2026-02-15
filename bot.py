@@ -307,6 +307,60 @@ class EcoFlowCog(discord.Cog):
     def __init__(self, bot: "EcoFlowBot") -> None:
         self.bot = bot
 
+    # ── Presence task (runs inside the Cog so @tasks.loop works) ──────
+
+    @discord.Cog.listener()
+    async def on_ready(self) -> None:
+        self._update_presence.start()
+
+    def cog_unload(self) -> None:
+        self._update_presence.cancel()
+
+    @tasks.loop(seconds=60)
+    async def _update_presence(self) -> None:
+        """Update bot status to show battery percentage."""
+        try:
+            if self.bot._monitor is None:
+                return
+            state = await self.bot._monitor.get_state()
+            if state.soc is not None:
+                icon = "⚡" if state.is_charging else "🔋"
+                label = "Charging" if state.is_charging else "Idle"
+                activity = discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=f"{icon} {state.soc:.0f}% | {label}",
+                )
+                await self.bot.change_presence(activity=activity)
+
+                print(f"\nPresence updated:\n{icon} {state.soc:.0f}% | {label}")
+            
+            else:
+                # get data from rest api
+                flat = await self.bot.loop.run_in_executor(
+                    None,
+                    get_device_quota,
+                    self.bot.cfg.api_host,
+                    self.bot.cfg.ecoflow_access_key,
+                    self.bot.cfg.ecoflow_secret_key,
+                    self.bot.cfg.device_sn,
+                )
+                state = DeviceState(flat, self.bot.cfg.charging_watts_threshold)
+                icon = "⚡" if state.is_charging else "🔋"
+                label = "Charging" if state.is_charging else "Idle"
+                activity = discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=f"{icon} {state.soc:.0f}% | {label}",
+                )
+                await self.bot.change_presence(activity=activity)
+
+                print(f"\nPresence updated:\n{icon} {state.soc:.0f}% | {label}")
+        except Exception:
+            logger.debug("Failed to update presence", exc_info=True)
+    
+    @_update_presence.before_loop
+    async def _before_update_presence(self) -> None:
+        await self.bot.wait_until_ready()
+
     # ── /status ────────────────────────────────────────────────────────
 
     @discord.slash_command(name="status", description="Show current power station status")
@@ -510,39 +564,13 @@ class EcoFlowBot(discord.Bot):
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         await self._start_monitor()
-        if not self._update_presence.is_running():
-            self._update_presence.start()
 
     async def close(self) -> None:
-        if self._update_presence.is_running():
-            self._update_presence.cancel()
         if self._monitor:
             logger.info("Stopping MQTT monitor…")
             self._monitor.stop()
         await super().close()
 
-    # ------------------------------------------------------------------
-    # Presence update loop  (py-cord tasks extension)
-    # ------------------------------------------------------------------
-
-    @tasks.loop(seconds=60)
-    async def _update_presence(self) -> None:
-        """Update bot status to show battery percentage."""
-        try:
-            if self._monitor is None:
-                return
-            state = await self._monitor.get_state()
-            if state.soc is not None:
-                icon = "⚡" if state.is_charging else "🔋"
-                label = "Charging" if state.is_charging else "Idle"
-                activity = discord.Activity(
-                    type=discord.ActivityType.watching,
-                    name=f"{icon} {state.soc:.0f}% | {label}",
-                )
-                await self.change_presence(activity=activity)
-                print(f"\nPresence updated:\n{icon} {state.soc:.0f}% | {label}")
-        except Exception:
-            logger.debug("Failed to update presence", exc_info=True)
 
     # ------------------------------------------------------------------
     # Monitor startup

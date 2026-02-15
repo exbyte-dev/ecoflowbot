@@ -304,8 +304,19 @@ class EcoFlowMonitor:
             logger.debug("Bad MQTT payload: %s", exc)
             return
 
+        logger.info(
+            "MQTT msg on %s — top-level keys: %s",
+            msg.topic, list(payload.keys()),
+        )
+
         params = payload.get("params", payload)
         incoming = _flatten(params)
+
+        logger.info(
+            "Flattened %d keys; sample: %s",
+            len(incoming),
+            list(incoming.keys())[:8],
+        )
 
         with self._lock:
             self._flat.update(incoming)
