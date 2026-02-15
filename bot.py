@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 import discord
 
 from config import Config
-from ecoflow.auth import get_mqtt_credentials
+from ecoflow.auth import get_device_quota, get_mqtt_credentials
 from ecoflow.monitor import DeviceState, EcoFlowMonitor
 
 # ---------------------------------------------------------------------------
@@ -48,11 +48,16 @@ def _fmt_watts(w: float | None) -> str:
     return f"{w:.0f} W" if w is not None else "—"
 
 def _fmt_volts(v: float | None) -> str:
-    # EcoFlow sends millivolts for some fields; normalise values > 1000 V
+    # EcoFlow sends voltages in different units depending on the field:
+    #   millivolts  (e.g. inv.acInVol = 253054 → 253 V) : divide by 1000
+    #   tenths of V (e.g. 2300 → 230 V)                 : divide by 10
+    #   actual volts (e.g. 230)                          : use as-is
     if v is None:
         return "—"
-    if v > 1000:
-        v /= 10   # some firmware reports in tenths of a volt
+    if v > 10_000:
+        v /= 1000   # millivolts
+    elif v > 1_000:
+        v /= 10     # tenths of a volt
     return f"{v:.0f} V"
 
 def _fmt_pct(p: float | None) -> str:
@@ -105,6 +110,8 @@ def build_status_embed(
     elif not state.is_charging and state.dsg_remain_min:
         batt_lines.append(f"~{_fmt_remain(state.dsg_remain_min)} remaining")
     batt_lines.append(_chg_state_label(state.chg_state))
+    if state.batt_remain_cap is not None and state.batt_full_cap is not None:
+        batt_lines.append(f"{state.batt_remain_cap:.0f} / {state.batt_full_cap:.0f} mAh")
     embed.add_field(name="🔋 Battery", value="\n".join(batt_lines), inline=True)
 
     # ── Power flow ─────────────────────────────────────────────
@@ -113,6 +120,9 @@ def build_status_embed(
     embed.add_field(name="⚡ Input",  value=_fmt_watts(watts_in),  inline=True)
     embed.add_field(name="💡 Output", value=_fmt_watts(watts_out), inline=True)
 
+    # ── Solar / MPPT ───────────────────────────────────────────
+    embed.add_field(name="☀️ Solar", value=_fmt_watts(state.solar_watts), inline=True)
+
     # ── AC input ───────────────────────────────────────────────
     ac_in_parts = [_fmt_volts(state.ac_in_voltage)]
     if state.ac_in_watts is not None:
@@ -120,21 +130,67 @@ def build_status_embed(
     if state.ac_in_freq is not None:
         ac_in_parts.append(f"{state.ac_in_freq:.0f} Hz")
     embed.add_field(
-        name="🔌 AC Input",
+        name="🔌 AC In",
         value="  ·  ".join(p for p in ac_in_parts if p != "—") or "—",
         inline=True,
     )
 
-    # ── Output switches ───────────────────────────────────────
-    ac_out_val = _onoff(state.ac_out_enabled)
+    # ── AC output ─────────────────────────────────────────────
+    ac_out_parts = [_onoff(state.ac_out_enabled)]
+    if state.ac_out_voltage is not None:
+        ac_out_parts.append(_fmt_volts(state.ac_out_voltage))
+    if state.ac_out_freq is not None:
+        ac_out_parts.append(f"{state.ac_out_freq:.0f} Hz")
     if state.ac_out_watts is not None:
-        ac_out_val += f"  ·  {_fmt_watts(state.ac_out_watts)}"
-    embed.add_field(name="🔌 AC Output", value=ac_out_val,                    inline=True)
-    embed.add_field(name="🔌 USB / DC",  value=_onoff(state.usb_out_enabled), inline=True)
+        ac_out_parts.append(_fmt_watts(state.ac_out_watts))
+    embed.add_field(name="🔌 AC Out", value="  ·  ".join(ac_out_parts), inline=True)
 
-    # ── Temperature ───────────────────────────────────────────
+    # ── DC ports ──────────────────────────────────────────────
+    port_lines = []
+    # USB-A
+    usb_a = (state.usb1_watts or 0) + (state.usb2_watts or 0) + \
+            (state.qc_usb1_watts or 0) + (state.qc_usb2_watts or 0)
+    usb_a_state = _onoff(state.usb_out_enabled)
+    port_lines.append(f"USB-A: {usb_a_state}  ({usb_a:.0f} W)" if usb_a else f"USB-A: {usb_a_state}")
+    # USB-C
+    usb_c = (state.typec1_watts or 0) + (state.typec2_watts or 0)
+    if usb_c:
+        port_lines.append(f"USB-C: {usb_c:.0f} W")
+        if state.typec1_watts:
+            port_lines.append(f"  C1: {state.typec1_watts:.0f} W")
+        if state.typec2_watts:
+            port_lines.append(f"  C2: {state.typec2_watts:.0f} W")
+    else:
+        port_lines.append("USB-C: —")
+    # 12 V car
+    car_state = _onoff(state.dc_out_enabled)
+    car_w = state.car_watts
+    port_lines.append(f"Car 12V: {car_state}  ({car_w:.0f} W)" if car_w else f"Car 12V: {car_state}")
+    embed.add_field(name="🔌 DC Ports", value="\n".join(port_lines), inline=True)
+
+    # ── Battery health ────────────────────────────────────────
+    health_parts = []
+    if state.batt_soh is not None:
+        health_parts.append(f"SOH {state.batt_soh}%")
+    if state.batt_cycles is not None:
+        health_parts.append(f"{state.batt_cycles} cycles")
+    if health_parts:
+        embed.add_field(name="🏥 Health", value="\n".join(health_parts), inline=True)
+
+    # ── Temperatures ──────────────────────────────────────────
+    temp_parts = []
+    if state.batt_temp_c is not None:
+        temp_parts.append(f"Battery: {_fmt_temp(state.batt_temp_c)}")
     if state.inv_temp_c is not None:
-        embed.add_field(name="🌡 Temp", value=_fmt_temp(state.inv_temp_c), inline=True)
+        temp_parts.append(f"Inverter: {_fmt_temp(state.inv_temp_c)}")
+    if temp_parts:
+        embed.add_field(name="🌡 Temps", value="\n".join(temp_parts), inline=True)
+
+    # ── Charge limits (only show if non-default) ──────────────
+    if state.max_charge_soc is not None or state.min_dsg_soc is not None:
+        max_s = f"Max {state.max_charge_soc}%" if state.max_charge_soc is not None else "Max —"
+        min_s = f"Min {state.min_dsg_soc}%" if state.min_dsg_soc is not None else "Min —"
+        embed.add_field(name="⚙️ Limits", value=f"{max_s}\n{min_s}", inline=True)
 
     return embed
 
@@ -160,25 +216,22 @@ class EcoFlowCog(discord.Cog):
             return
 
         try:
-            monitor = self.bot._monitor
+            cfg = self.bot.cfg
+            loop = asyncio.get_event_loop()
 
-            if monitor is None:
-                await ctx.respond("Monitor is not started yet. Try again in a moment.")
-                return
+            # Fetch fresh data directly from the REST API (blocking call → executor).
+            flat = await loop.run_in_executor(
+                None,
+                get_device_quota,
+                cfg.api_host,
+                cfg.ecoflow_access_key,
+                cfg.ecoflow_secret_key,
+                cfg.device_sn,
+            )
 
-            monitor_connected = await monitor.is_connected
-            
-            if not monitor_connected:
-                await ctx.respond(embed=discord.Embed(
-                    description="Not connected to EcoFlow — trying to reconnect.",
-                    colour=COLOUR_WARN,
-                ))
-                return
-
-            state   = await monitor.get_state()
-            charging = await monitor.current_charging
-            colour  = COLOUR_CHARGING if charging else (COLOUR_STOPPED if charging is False else COLOUR_WARN)
-            embed   = build_status_embed(state, self.bot.cfg.device_sn, colour=colour)
+            state  = DeviceState(flat, cfg.charging_watts_threshold)
+            colour = COLOUR_CHARGING if state.is_charging else (COLOUR_STOPPED if state.is_charging is False else COLOUR_WARN)
+            embed  = build_status_embed(state, cfg.device_sn, colour=colour)
             await ctx.respond(embed=embed)
 
         except Exception:
@@ -190,8 +243,14 @@ class EcoFlowCog(discord.Cog):
     # ── /ac ────────────────────────────────────────────────────────────
 
     @discord.slash_command(name="ac", description="Turn AC output on or off")
-    @discord.option("state", description="on or off", choices=["on", "off"])
-    async def cmd_ac(self, ctx: discord.ApplicationContext, state: str) -> None:
+    async def cmd_ac(self, 
+                    ctx: discord.ApplicationContext,
+                    state: discord.Option(
+                        str,
+                        "on or off",
+                        choices=["on", "off"]
+                    )
+                    ) -> None:
         await ctx.defer()
 
         try:
@@ -236,8 +295,14 @@ class EcoFlowCog(discord.Cog):
     # ── /usb ───────────────────────────────────────────────────────────
 
     @discord.slash_command(name="usb", description="Turn USB / DC output on or off")
-    @discord.option("state", description="on or off", choices=["on", "off"])
-    async def cmd_usb(self, ctx: discord.ApplicationContext, state: str) -> None:
+    async def cmd_usb(self, 
+                    ctx: discord.ApplicationContext,
+                    state: discord.Option(
+                        str,
+                        "on or off",
+                        choices=["on", "off"]
+                    )
+                    ) -> None:
         await ctx.defer()
 
         try:
@@ -277,8 +342,14 @@ class EcoFlowCog(discord.Cog):
     # ── /dc ────────────────────────────────────────────────────────────
 
     @discord.slash_command(name="dc", description="Turn 12 V car / cigarette-lighter port on or off")
-    @discord.option("state", description="on or off", choices=["on", "off"])
-    async def cmd_dc(self, ctx: discord.ApplicationContext, state: str) -> None:
+    async def cmd_dc(self, 
+                    ctx: discord.ApplicationContext,
+                    state: discord.Option(
+                        str,
+                        "on or off",
+                        choices=["on", "off"]
+                    )
+                    ) -> None:
         await ctx.defer()
 
         try:

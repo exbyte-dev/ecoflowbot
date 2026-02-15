@@ -70,6 +70,37 @@ class MqttCredentials:
     protocol: str      # usually "mqtts"
 
 
+def get_device_quota(api_host: str, access_key: str, secret_key: str, device_sn: str) -> dict:
+    """
+    Call GET /iot-open/sign/device/quota/all to retrieve all current device properties.
+
+    Returns a flat dict of property key → value pairs (same dot-notation format
+    used by the MQTT stream cache, e.g. {"pd.soc": 85, "inv.inputWatts": 0, ...}).
+
+    Raises:
+        requests.HTTPError: on non-2xx HTTP responses
+        ValueError: if the EcoFlow API returns a non-zero error code
+    """
+    url = f"{api_host}/iot-open/sign/device/quota/all"
+    params = {"sn": device_sn}
+    headers = _build_headers(access_key, secret_key, params)
+
+    logger.info("Fetching device quota from %s (sn=%s)", url, device_sn)
+    response = requests.get(url, headers=headers, params=params, timeout=15)
+    response.raise_for_status()
+
+    body = response.json()
+    code = body.get("code")
+    if code != "0":
+        raise ValueError(
+            f"EcoFlow API error (code={code}): {body.get('message', 'Unknown error')}"
+        )
+
+    print(body)
+    print(f"\n\n\n\n{body['data']}\n\n\n\n")
+    return body["data"]
+
+
 def get_mqtt_credentials(api_host: str, access_key: str, secret_key: str) -> MqttCredentials:
     """
     Call GET /iot-open/sign/certification to retrieve MQTT broker credentials.

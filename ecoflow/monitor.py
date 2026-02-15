@@ -103,6 +103,8 @@ class DeviceState:
         "ac_in_voltage",
         "ac_in_freq",
         "ac_out_enabled",
+        "ac_out_voltage",
+        "ac_out_freq",
         "usb_out_enabled",
         "dc_out_enabled",
         "chg_state",
@@ -110,11 +112,39 @@ class DeviceState:
         "dsg_remain_min",
         "inv_temp_c",
         "is_charging",
+        # Solar / MPPT
+        "solar_watts",
+        # Per-port output watts
+        "usb1_watts",
+        "usb2_watts",
+        "qc_usb1_watts",
+        "qc_usb2_watts",
+        "typec1_watts",
+        "typec2_watts",
+        "car_watts",
+        # Battery health
+        "batt_temp_c",
+        "batt_soh",
+        "batt_cycles",
+        "batt_remain_cap",   # mAh
+        "batt_full_cap",     # mAh
+        # Charge limits
+        "max_charge_soc",
+        "min_dsg_soc",
     )
 
     def __init__(self, flat: dict[str, Any], watts_threshold: float) -> None:
         def f(key: str) -> float | None:
             return _coerce_float(flat.get(key))
+
+        def i(key: str) -> int | None:
+            v = flat.get(key)
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return None
 
         def b(key: str) -> bool | None:
             v = flat.get(key)
@@ -130,21 +160,44 @@ class DeviceState:
         self.watts_out: float | None = f("pd.wattsOutSum")
         self.ac_in_watts: float | None = f("inv.inputWatts")
         self.ac_out_watts: float | None = f("inv.outputWatts")
+        # EcoFlow sends these as millivolts (e.g. 253054 → 253.054 V)
         self.ac_in_voltage: float | None = f("inv.acInVol")
         self.ac_in_freq: float | None = f("inv.acInFreq")
         self.ac_out_enabled: bool | None = b("inv.cfgAcEnabled")
+        self.ac_out_voltage: float | None = f("inv.invOutVol")   # millivolts
+        self.ac_out_freq: float | None = f("inv.invOutFreq")
         # USB/DC 5V–12V outputs
         self.usb_out_enabled: bool | None = b("pd.dcOutState")
         # 12 V car port
         self.dc_out_enabled: bool | None = b("pd.carState")
-        self.chg_state: int | None = (
-            int(flat["bms_emsStatus.chgState"])
-            if flat.get("bms_emsStatus.chgState") is not None else None
-        )
+        self.chg_state: int | None = i("bms_emsStatus.chgState")
         self.chg_remain_min: float | None = f("bms_emsStatus.chgRemainTime")
         self.dsg_remain_min: float | None = f("bms_emsStatus.dsgRemainTime")
         self.inv_temp_c: float | None = f("inv.outTemp")
         self.is_charging: bool | None = _is_charging(flat, watts_threshold)
+
+        # Solar / MPPT input
+        self.solar_watts: float | None = f("mppt.inWatts")
+
+        # Per-port output watts
+        self.usb1_watts: float | None = f("pd.usb1Watts")
+        self.usb2_watts: float | None = f("pd.usb2Watts")
+        self.qc_usb1_watts: float | None = f("pd.qcUsb1Watts")
+        self.qc_usb2_watts: float | None = f("pd.qcUsb2Watts")
+        self.typec1_watts: float | None = f("pd.typec1Watts")
+        self.typec2_watts: float | None = f("pd.typec2Watts")
+        self.car_watts: float | None = f("pd.carWatts")
+
+        # Battery health
+        self.batt_temp_c: float | None = f("bms_bmsStatus.temp")
+        self.batt_soh: int | None = i("bms_bmsStatus.soh")
+        self.batt_cycles: int | None = i("bms_bmsStatus.cycles")
+        self.batt_remain_cap: float | None = f("bms_bmsStatus.remainCap")  # mAh
+        self.batt_full_cap: float | None = f("bms_bmsStatus.fullCap")      # mAh
+
+        # Charge limits
+        self.max_charge_soc: int | None = i("bms_emsStatus.maxChargeSoc")
+        self.min_dsg_soc: int | None = i("bms_emsStatus.minDsgSoc")
 
     @property
     def has_data(self) -> bool:
