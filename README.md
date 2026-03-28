@@ -27,11 +27,11 @@ Discord ◄───────────────────────
                                                   │
                  EcoFlow REST API                 │  on_ready
           ┌──── GET /iot-open/sign/certification ─┤
-          │     (HMAC-SHA256 signed)               │
-          ▼                                        │
+          │     (HMAC-SHA256 signed)              │
+          ▼                                       │
      MQTT credentials                             │
-          │                                        │
-          ▼                                        ▼
+          │                                       │
+          ▼                                       ▼
   mqtt-e.ecoflow.com:8883               EcoFlowMonitor (thread)
   /open/{account}/{sn}/quota  ──push──► state cache + transition detection
   /open/{account}/{sn}/set    ◄─pub──── set_ac_output / set_usb_output / …
