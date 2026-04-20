@@ -64,20 +64,39 @@ def _coerce_float(value: Any) -> float | None:
 _CHARGING_CHG_STATE = 1
 
 
-def _is_charging(flat: dict[str, Any], watts_threshold: float) -> bool | None:
+def _is_charging(
+    flat: dict[str, Any],
+    watts_threshold: float,
+    previous: bool | None = None,
+) -> bool | None:
     """
-    Determine if grid power is flowing into the device.
+    Determine if grid (AC) power is flowing into the device.
 
-    Uses AC inverter input watts as the primary signal since this bot is
-    designed to detect grid restoration/loss. Solar and DC input are
-    intentionally ignored.
+    Uses hysteresis to avoid flapping near the threshold: once "charging",
+    watts must drop below (threshold - 5) to flip off; once "idle", watts
+    must rise above threshold to flip on.
+
+    Also suppresses transitions when the battery is at 100% SOC — the BMS
+    pulses AC on/off during its top-off cycle, which would otherwise spam
+    notifications.
     """
-    # Primary: AC input watts from the inverter (grid-specific).
     ac_in = _coerce_float(flat.get("inv.inputWatts"))
-    if ac_in is not None:
-        return ac_in > watts_threshold
 
-    # Fallback: BMS charging state.
+    # At 100% SOC, the device cycles AC input on/off for maintenance.
+    # Hold whatever state we had; don't treat the pulsing as grid events.
+    soc = _coerce_float(flat.get("pd.soc"))
+    if soc is not None and soc >= 100 and previous is not None:
+        return previous
+
+    if ac_in is not None:
+        if previous is True:
+            # Currently charging — need to drop well below threshold to flip off.
+            return ac_in > (watts_threshold - 5)
+        else:
+            # Currently idle or unknown — need to exceed threshold to flip on.
+            return ac_in > watts_threshold
+
+    # Fallback: BMS charging state (only if AC watts haven't arrived).
     chg_state = flat.get("bms_emsStatus.chgState")
     if chg_state is not None:
         try:
@@ -177,7 +196,9 @@ class DeviceState:
         self.chg_remain_min: float | None = f("bms_emsStatus.chgRemainTime")
         self.dsg_remain_min: float | None = f("bms_emsStatus.dsgRemainTime")
         self.inv_temp_c: float | None = f("inv.outTemp")
-        self.is_charging: bool | None = _is_charging(flat, watts_threshold)
+        self.is_charging: bool | None = _is_charging(
+            flat, watts_threshold, flat.get("__previous_charging"),
+        )
 
         # Solar / MPPT input
         self.solar_watts: float | None = f("mppt.inWatts")
@@ -348,6 +369,8 @@ class EcoFlowMonitor:
             flat_snapshot = dict(self._flat)
             previous = self._charging
 
+        # Thread previous state into DeviceState so _is_charging can apply hysteresis.
+        flat_snapshot["__previous_charging"] = previous
         state = DeviceState(flat_snapshot, self._watts_threshold)
 
         if state.is_charging is None:
