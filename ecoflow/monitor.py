@@ -32,8 +32,6 @@ from .auth import MqttCredentials
 
 logger = logging.getLogger(__name__)
 
-# chgState values that mean the battery is actively charging
-_CHARGING_STATES = {1, 2}
 
 
 # ---------------------------------------------------------------------------
@@ -61,28 +59,33 @@ def _coerce_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
 
+# Only chgState value that means "actively charging" on Delta 2 family.
+# (0 = idle, 1 = charging, 2 = discharging)
+_CHARGING_CHG_STATE = 1
+
 
 def _is_charging(flat: dict[str, Any], watts_threshold: float) -> bool | None:
     """
-    Determine charging state from a flattened MQTT payload.
+    Determine if grid power is flowing into the device.
 
-    Returns True/False, or None when there's not enough data.
+    Uses AC inverter input watts as the primary signal since this bot is
+    designed to detect grid restoration/loss. Solar and DC input are
+    intentionally ignored.
     """
+    # Primary: AC input watts from the inverter (grid-specific).
+    ac_in = _coerce_float(flat.get("inv.inputWatts"))
+    if ac_in is not None:
+        return ac_in > watts_threshold
+
+    # Fallback: BMS charging state.
     chg_state = flat.get("bms_emsStatus.chgState")
     if chg_state is not None:
         try:
-            return int(chg_state) in _CHARGING_STATES
+            return int(chg_state) == _CHARGING_CHG_STATE
         except (ValueError, TypeError):
             pass
 
-    # Fallback: total input watts
-    watts_in = flat.get("pd.wattsInSum") or flat.get("inv.inputWatts")
-    w = _coerce_float(watts_in)
-    if w is not None:
-        return w > watts_threshold
-
     return None
-
 
 # ---------------------------------------------------------------------------
 # DeviceState — typed snapshot of the latest cached values

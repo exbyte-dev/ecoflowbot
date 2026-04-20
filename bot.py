@@ -83,8 +83,10 @@ def _onoff(val: bool | None, *, true_label="ON", false_label="OFF") -> str:
     return true_label if val else false_label
 
 def _chg_state_label(state: int | None) -> str:
-    labels = {0: "Idle", 1: "CC Charging", 2: "CV Charging", 3: "CC Discharging", 4: "Discharging"}
-    return labels.get(state, "Unknown") if state is not None else "—"
+    labels = {0: "Idle", 1: "Charging", 2: "Discharging"}
+    if state is None:
+        return "—"
+    return labels.get(state, f"Unknown ({state})")
 
 
 # ---------------------------------------------------------------------------
